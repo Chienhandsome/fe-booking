@@ -10,6 +10,37 @@ type PaymentResult = {
     transactionId?: string | null;
 };
 
+type SocketConfigResolution =
+    | { ok: true; url: string; path: string }
+    | { ok: false; error: string };
+
+const resolveSocketConfig = (): SocketConfigResolution => {
+    const configuredSocketUrl = import.meta.env.VITE_NOTIFICATION_SOCKET_URL?.trim();
+    const configuredSocketPath = import.meta.env.VITE_NOTIFICATION_SOCKET_PATH?.trim() || '/socket.io';
+
+    if (configuredSocketUrl) {
+        return {
+            ok: true,
+            url: configuredSocketUrl,
+            path: configuredSocketPath,
+        };
+    }
+
+    if (import.meta.env.DEV) {
+        return {
+            ok: true,
+            // Dev-only fallback to current hostname and notification service port.
+            url: `${window.location.protocol}//${window.location.hostname}:8084`,
+            path: configuredSocketPath,
+        };
+    }
+
+    return {
+        ok: false,
+        error: 'Missing VITE_NOTIFICATION_SOCKET_URL in production environment.',
+    };
+};
+
 export default function Booking() {
     const location = useLocation();
     const navigate = useNavigate();
@@ -23,12 +54,27 @@ export default function Booking() {
     const timeoutRef = useRef<number | null>(null);
     const messageClass = messageKind === 'error' ? 'alert alert-error' : 'alert alert-info';
 
+    const clearNotificationTimeout = () => {
+        if (timeoutRef.current) {
+            window.clearTimeout(timeoutRef.current);
+            timeoutRef.current = null;
+        }
+    };
+
+    const teardownSocketConnection = () => {
+        if (!socketRef.current) {
+            return;
+        }
+
+        socketRef.current.removeAllListeners();
+        socketRef.current.disconnect();
+        socketRef.current = null;
+    };
+
     useEffect(() => {
         return () => {
-            if (timeoutRef.current) {
-                window.clearTimeout(timeoutRef.current);
-            }
-            socketRef.current?.disconnect();
+            clearNotificationTimeout();
+            teardownSocketConnection();
         };
     }, []);
 
@@ -37,84 +83,64 @@ export default function Booking() {
     }
 
     const waitForPaymentNotification = (bookingId: string) => {
-        const configuredSocketUrl = import.meta.env.VITE_NOTIFICATION_SOCKET_URL?.trim();
-        const configuredSocketPath = import.meta.env.VITE_NOTIFICATION_SOCKET_PATH?.trim();
+        clearNotificationTimeout();
+        teardownSocketConnection();
 
-        const connectionCandidates = [
-            {
-                url: configuredSocketUrl || 'http://127.0.0.1:8084',
-                path: configuredSocketPath || '/socket.io',
-            },
-            {
-                url: window.location.origin,
-                path: '/api/notification/socket.io',
-            },
-        ];
+        const socketConfig = resolveSocketConfig();
+        if (!socketConfig.ok) {
+            setMessageKind('error');
+            setMessage(socketConfig.error);
+            setLoading(false);
+            return;
+        }
 
-        let candidateIndex = 0;
+        const socket = io(socketConfig.url, {
+            path: socketConfig.path,
+            transports: ['websocket', 'polling'],
+            reconnection: false,
+            timeout: 5000,
+        });
 
-        const connect = () => {
-            const current = connectionCandidates[candidateIndex];
+        socketRef.current = socket;
 
-            socketRef.current?.disconnect();
-
-            const socket = io(current.url, {
-                path: current.path,
-                transports: ['websocket', 'polling'],
-                reconnection: false,
-                timeout: 5000,
-            });
-
-            socketRef.current = socket;
-
-            socket.on('connect', () => {
-                timeoutRef.current = window.setTimeout(() => {
-                    setMessageKind('error');
-                    setMessage('Payment notification timeout. Please check booking history.');
-                    setLoading(false);
-                    socket.disconnect();
-                }, 30000);
-            });
-
-            socket.on('connect_error', () => {
-                socket.disconnect();
-
-                candidateIndex += 1;
-                if (candidateIndex < connectionCandidates.length) {
-                    connect();
-                    return;
-                }
-
+        socket.on('connect', () => {
+            clearNotificationTimeout();
+            timeoutRef.current = window.setTimeout(() => {
                 setMessageKind('error');
-                setMessage('Cannot connect to payment notification channel.');
+                setMessage('Payment notification timeout. Please check booking history.');
                 setLoading(false);
-            });
+                clearNotificationTimeout();
+                teardownSocketConnection();
+            }, 30000);
+        });
 
-            socket.on('PAYMENT_RESULT', (payload: PaymentResult) => {
-                if (!payload?.bookingId || payload.bookingId !== bookingId) {
-                    return;
-                }
+        socket.on('connect_error', () => {
+            clearNotificationTimeout();
+            setMessageKind('error');
+            setMessage('Cannot connect to payment notification channel.');
+            setLoading(false);
+            teardownSocketConnection();
+        });
 
-                if (timeoutRef.current) {
-                    window.clearTimeout(timeoutRef.current);
-                    timeoutRef.current = null;
-                }
+        socket.on('PAYMENT_RESULT', (payload: PaymentResult) => {
+            if (!payload?.bookingId || payload.bookingId !== bookingId) {
+                return;
+            }
 
-                if (payload.status === 'SUCCESS') {
-                    setMessageKind('info');
-                    setMessage(payload.message || `Booking #${bookingId} confirmed successfully.`);
-                } else {
-                    setMessageKind('error');
-                    setMessage(payload.message || 'Payment failed. Please try again.');
-                }
+            clearNotificationTimeout();
 
-                setNeedConfirmRedirect(true);
-                setLoading(false);
-                socket.disconnect();
-            });
-        };
+            if (payload.status === 'SUCCESS') {
+                setMessageKind('info');
+                setMessage(payload.message || `Booking #${bookingId} confirmed successfully.`);
+            } else {
+                setMessageKind('error');
+                setMessage(payload.message || 'Payment failed. Please try again.');
+            }
 
-        connect();
+            setNeedConfirmRedirect(true);
+            setLoading(false);
+            teardownSocketConnection();
+        });
     };
 
     const handleBooking = async (e: React.FormEvent) => {
